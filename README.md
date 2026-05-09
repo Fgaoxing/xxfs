@@ -26,23 +26,22 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 
 | 操作 | XXFS | ext4 | btrfs | XFS | FAT32 |
 |------|------|------|-------|-----|-------|
-| create | **3.11 us** | 14.10 us | 8.57 us | * | * |
-| stat | **0.36 us** | 1.06 us | 0.76 us | * | * |
-| stat (random) | **0.26 us** | 1.15 us | 0.56 us | * | * |
-| read small | **0.29 us** | 3.70 us | 2.80 us | * | * |
-| read (random) | **0.17 us** | 3.44 us | 1.35 us | * | * |
-| mkdir | **4.25 us** | 16.83 us | 7.15 us | * | * |
-| unlink | **1.22 us** | 6.81 us | 10.86 us | * | * |
+| create | **3.77 us** | 7.22 us | 10.39 us | 4.57 us | 550.18 us |
+| stat | **0.40 us** | 1.15 us | 1.02 us | 1.17 us | 1.20 us |
+| stat (random) | **0.31 us** | 0.77 us | 0.83 us | 1.36 us | 0.89 us |
+| read small | **0.42 us** | 2.47 us | 2.80 us | 2.96 us | 3.91 us |
+| read (random) | **0.33 us** | 1.92 us | 1.76 us | 1.86 us | 3.59 us |
+| mkdir | **4.69 us** | 10.33 us | 9.73 us | 2.75 us | 1072.28 us |
+| unlink | **1.42 us** | 8.14 us | 12.73 us | 4.06 us | 27.56 us |
 
 *测试环境：1000 个文件，256MB 镜像，tmpfs 底层存储*
 
-\* 运行 `./bench/compare.sh` 获取完整的性能对比数据（包括 XFS、FAT32、exFAT、ZFS）
-
 **关键优势**：
 
-- **create** 比 ext4 快 **4.5x**，比 btrfs 快 **2.8x**
-- **stat/read** 比所有内核文件系统快 **3.0-20.2x**
-- **mkdir** 比 ext4 快 **4.0x**，比 btrfs 快 **1.7x**
+- **create** 比 ext4 快 **1.9x**，比 btrfs 快 **2.8x**，比 XFS 快 **1.2x**，比 FAT32 快 **146x**
+- **stat/read** 比所有内核文件系统快 **2.5-9.3x**
+- **mkdir** 比 ext4 快 **2.2x**，比 btrfs 快 **2.1x**，比 FAT32 快 **229x**
+- **unlink** 比 ext4 快 **5.7x**，比 btrfs 快 **9.0x**，比 FAT32 快 **19x**
 
 ## 架构
 
