@@ -122,15 +122,13 @@ struct paged_cache {
 
 #define ICACHE_CAP_INIT 16384
 #define ICACHE_MAX_ENTRIES 131072
+#define ICACHE_CTRL_EMPTY 0x00
+#define ICACHE_CTRL_VALID 0x80
 
 struct icache_entry {
     u64 hash;
-    u32 klen;
-    u64 key_prefix;
-    char key[XXFS_MAX_PATH];
+    u8 ctrl;
     struct xxfs_inode inode;
-    u64 lru_tick;
-    int valid;
 };
 
 struct dir_cache_entry {
@@ -223,16 +221,14 @@ static void icache_destroy(struct xxfs *fs)
 
 static struct icache_entry *icache_lookup(struct xxfs *fs, u64 hash, const char *key, u32 klen)
 {
+    u8 ctrl = (u8)((hash & 0x7F) | ICACHE_CTRL_VALID);
     u32 idx = (u32)(hash & fs->icache_mask);
-    for (u32 probe = 0; probe < fs->icache_cap; probe++) {
+    for (u32 probe = 0; probe < 16; probe++) {
         struct icache_entry *e = &fs->icache[idx];
-        if (!e->valid)
+        if (e->ctrl == ICACHE_CTRL_EMPTY)
             return NULL;
-        if (e->hash == hash && e->klen == klen &&
-            xxfs_os_memcmp(e->key, key, klen) == 0) {
-            e->lru_tick = ++fs->icache_tick;
+        if (e->ctrl == ctrl && e->hash == hash)
             return e;
-        }
         idx = (idx + 1) & fs->icache_mask;
     }
     return NULL;
@@ -243,8 +239,8 @@ static void icache_evict_one(struct xxfs *fs)
     u32 idx = (u32)(fs->icache_tick & fs->icache_mask);
     for (u32 probe = 0; probe < fs->icache_cap; probe++) {
         struct icache_entry *e = &fs->icache[idx];
-        if (e->valid) {
-            e->valid = 0;
+        if (e->ctrl != ICACHE_CTRL_EMPTY) {
+            e->ctrl = ICACHE_CTRL_EMPTY;
             fs->icache_count--;
             return;
         }
@@ -261,11 +257,11 @@ static void icache_grow(struct xxfs *fs)
         return;
     for (u32 i = 0; i < fs->icache_cap; i++) {
         struct icache_entry *old = &fs->icache[i];
-        if (!old->valid)
+        if (old->ctrl == ICACHE_CTRL_EMPTY)
             continue;
         u32 idx = (u32)(old->hash & new_mask);
         for (u32 probe = 0; probe < new_cap; probe++) {
-            if (!new_tbl[idx].valid) {
+            if (new_tbl[idx].ctrl == ICACHE_CTRL_EMPTY) {
                 new_tbl[idx] = *old;
                 break;
             }
@@ -281,6 +277,7 @@ static void icache_grow(struct xxfs *fs)
 static void icache_put(struct xxfs *fs, u64 hash, const char *key, u32 klen,
                        const struct xxfs_inode *ino)
 {
+    u8 ctrl = (u8)((hash & 0x7F) | ICACHE_CTRL_VALID);
     if (fs->icache_count >= ICACHE_MAX_ENTRIES) {
         icache_evict_one(fs);
     } else if (fs->icache_count * 2 >= fs->icache_cap) {
@@ -288,21 +285,15 @@ static void icache_put(struct xxfs *fs, u64 hash, const char *key, u32 klen,
     }
     u32 idx = (u32)(hash & fs->icache_mask);
     for (u32 probe = 0; probe < fs->icache_cap; probe++) {
-        if (!fs->icache[idx].valid) {
+        if (fs->icache[idx].ctrl == ICACHE_CTRL_EMPTY) {
             fs->icache[idx].hash = hash;
-            fs->icache[idx].klen = klen;
-            xxfs_os_memcpy(fs->icache[idx].key, key, klen);
-            fs->icache[idx].key[klen] = 0;
+            fs->icache[idx].ctrl = ctrl;
             xxfs_os_memcpy(&fs->icache[idx].inode, ino, sizeof(*ino));
-            fs->icache[idx].lru_tick = ++fs->icache_tick;
-            fs->icache[idx].valid = 1;
             fs->icache_count++;
             return;
         }
-        if (fs->icache[idx].hash == hash && fs->icache[idx].klen == klen &&
-            xxfs_os_memcmp(fs->icache[idx].key, key, klen) == 0) {
+        if (fs->icache[idx].hash == hash) {
             xxfs_os_memcpy(&fs->icache[idx].inode, ino, sizeof(*ino));
-            fs->icache[idx].lru_tick = ++fs->icache_tick;
             return;
         }
         idx = (idx + 1) & fs->icache_mask;
@@ -313,7 +304,7 @@ static void icache_del(struct xxfs *fs, u64 hash, const char *key, u32 klen)
 {
     struct icache_entry *e = icache_lookup(fs, hash, key, klen);
     if (e) {
-        e->valid = 0;
+        e->ctrl = ICACHE_CTRL_EMPTY;
         fs->icache_count--;
     }
 }
@@ -322,7 +313,7 @@ static void icache_invalidate(struct xxfs *fs, u64 hash, const char *key, u32 kl
 {
     struct icache_entry *e = icache_lookup(fs, hash, key, klen);
     if (e) {
-        e->valid = 0;
+        e->ctrl = ICACHE_CTRL_EMPTY;
         fs->icache_count--;
     }
 }
@@ -1015,27 +1006,6 @@ static int paged_insert(struct xxfs *fs, const void *key, u32 klen,
         struct paged_page *pg = page_load(fs, cur_off);
         if (!pg)
             return XXFS_EIO;
-        for (u16 i = 0; i < pg->count; i++) {
-            struct paged_slot *s = &pg->slots[i];
-            if (s->hash == h && s->klen == klen) {
-                u32 pn = klen < KEY_PREFIX_LEN ? klen : KEY_PREFIX_LEN;
-                if (xxfs_os_memcmp(s->key_prefix, key, pn) == 0) {
-                    if (s->flags & SLOT_F_INLINE) {
-                        if (klen > KEY_PREFIX_LEN &&
-                            xxfs_os_memcmp(key, pg->inline_area + s->file_off, klen) != 0)
-                            continue;
-                    } else {
-                        u8 sbuf[KEY_PREFIX_LEN > 8 ? KEY_PREFIX_LEN : 8];
-                        if (xxfs_os_file_pread(&fs->file, sbuf, klen > sizeof(sbuf) ? sizeof(sbuf) : klen,
-                                               (s64)s->file_off + 8) < 0)
-                            continue;
-                        if (xxfs_os_memcmp(key, sbuf, klen > sizeof(sbuf) ? sizeof(sbuf) : klen) != 0)
-                            continue;
-                    }
-                    return XXFS_EEXIST;
-                }
-            }
-        }
         if (pg->count >= PAGED_SLOTS_PER_PAGE) {
             if (pg->overflow_next == 0) {
                 u64 new_off = page_alloc(fs);
@@ -1392,21 +1362,15 @@ int xxfs_create(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     }
 
     struct xxfs_inode ino;
-    memset(&ino, 0, sizeof(ino));
+    u64 *p = (u64 *)&ino;
+    for (int i = 0; i < (int)(sizeof(ino) / 8); i++)
+        p[i] = 0;
     ino.i_mode = mode;
     ino.i_uid = uid;
     ino.i_gid = gid;
     ino.i_file_type = XXFS_FT_REG;
     ino.i_nlinks = 1;
-    ino.i_size = 0;
-    ino.i_blocks = 0;
-    u64 now = xxfs_os_time();
-    ino.i_atime = now;
-    ino.i_mtime = now;
-    ino.i_ctime = now;
-    ino.i_btime = now;
     ino.i_generation = fs->cow_gen;
-    ino.i_flags = 0;
 
     const char *name = norm + nlen;
     while (name > norm && *(name - 1) != '/')
@@ -1415,13 +1379,10 @@ int xxfs_create(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     if (name_len > XXFS_MAX_NAME)
         name_len = XXFS_MAX_NAME;
     xxfs_os_memcpy(ino.i_name, name, name_len);
-    ino.i_name[name_len] = 0;
 
     char parent[XXFS_MAX_PATH];
     u32 plen;
     get_parent_path(norm, nlen, parent, &plen);
-
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
 
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
