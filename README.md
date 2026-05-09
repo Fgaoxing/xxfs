@@ -192,9 +192,19 @@ mkfs.xxfs myfs.img
 # XXFS benchmark
 ./xxfs-bench -n 10000 -s 256
 
-# 对比 ext4/btrfs
+# 对比多种文件系统 (ext4, btrfs, XFS, FAT32, exFAT, ZFS)
 ./bench/compare.sh 10000
 ```
+
+支持的对比文件系统：
+- **ext4** — Linux默认文件系统
+- **btrfs** — CoW文件系统
+- **XFS** — 高性能文件系统
+- **FAT32** — 简单的兼容性格式
+- **exFAT** — 优化的闪存文件系统
+- **ZFS** — 企业级文件系统
+
+脚本会自动检测系统上可用的文件系统工具。
 
 ## API
 
