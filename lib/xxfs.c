@@ -678,6 +678,33 @@ static u64 page_alloc(struct xxfs *fs)
     return off;
 }
 
+static u64 page_alloc_n(struct xxfs *fs, u64 n)
+{
+    if (n == 0)
+        return 0;
+    if (n == 1)
+        return page_alloc(fs);
+    
+    u64 off = fs->sb.s_data_off + (fs->sb.s_free_blocks > 0 ? (fs->sb.s_block_count - fs->sb.s_free_blocks) * XXFS_BLOCK_SIZE : 0);
+    
+    if (fs->sb.s_free_blocks >= n) {
+        fs->sb.s_free_blocks -= n;
+        return off;
+    }
+    
+    u64 avail = fs->sb.s_free_blocks;
+    u64 need = n - avail;
+    
+    s64 new_size = (s64)(off + need * XXFS_BLOCK_SIZE);
+    if (xxfs_os_file_extend(&fs->file, new_size))
+        return 0;
+    
+    fs->sb.s_block_count += need;
+    fs->sb.s_free_blocks = 0;
+    
+    return off;
+}
+
 static u64 page_alloc_raw(struct xxfs *fs)
 {
     s64 fsize = xxfs_os_file_size(&fs->file);
@@ -1668,18 +1695,26 @@ int xxfs_write(struct xxfs *fs, const char *path, const void *buf, u64 off, u32 
 
     u64 need_end = off + len;
     u64 need_blocks = (need_end + XXFS_BLOCK_SIZE - 1) / XXFS_BLOCK_SIZE;
+    
     if (need_blocks > ino.i_blocks) {
-        u64 new_off = page_alloc(fs);
+        u64 add_blocks = need_blocks - ino.i_blocks;
+        u64 new_off = page_alloc_n(fs, add_blocks);
         if (!new_off) {
             fs_wunlock(fs);
             return XXFS_ENOSPC;
         }
+        
         if (ino.i_blocks > 0 && ino.i_extent_off) {
-            u8 *tmp = xxfs_os_alloc((size_t)(ino.i_blocks * XXFS_BLOCK_SIZE));
-            if (tmp) {
-                xxfs_os_file_pread(&fs->file, tmp, (size_t)(ino.i_blocks * XXFS_BLOCK_SIZE), (s64)ino.i_extent_off);
-                xxfs_os_file_pwrite(&fs->file, tmp, (size_t)(ino.i_blocks * XXFS_BLOCK_SIZE), (s64)new_off);
-                xxfs_os_free(tmp);
+            if (new_off == ino.i_extent_off + ino.i_blocks * XXFS_BLOCK_SIZE) {
+                // 连续分配，无需拷贝
+            } else {
+                // 不连续，需要拷贝旧数据
+                u8 *tmp = xxfs_os_alloc((size_t)(ino.i_blocks * XXFS_BLOCK_SIZE));
+                if (tmp) {
+                    xxfs_os_file_pread(&fs->file, tmp, (size_t)(ino.i_blocks * XXFS_BLOCK_SIZE), (s64)ino.i_extent_off);
+                    xxfs_os_file_pwrite(&fs->file, tmp, (size_t)(ino.i_blocks * XXFS_BLOCK_SIZE), (s64)new_off);
+                    xxfs_os_free(tmp);
+                }
             }
         }
         ino.i_extent_off = new_off;
