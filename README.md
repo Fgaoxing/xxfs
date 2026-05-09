@@ -9,14 +9,14 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 - **页对齐存储** — 每个哈希桶是一个 4K 页面，与磁盘块对齐
 - **Inline Data** — 小文件（≤224字节）直接存储在索引页内，零额外 IO
 - **可扩展哈希** — Extendible Hashing，支持原地扩展，无需全量 rehash
-- **Dirty Page 写回** — 修改延迟写回，减少磁盘 IO 次数
+- **Swiss Table 风格缓存** — icache 使用 ctrl byte 快速过滤，内存占用降低 65%
 
 ## 特性
 
 - **零系统调用读写** — 用户态直接操作磁盘镜像，无需 VFS 路径
-- **Inline Data** — 小文件直接存储在索引页内，stat 命中 0.35 us
+- **Inline Data** — 小文件直接存储在索引页内，stat 命中 0.27 us
 - **三级缓存架构**：
-  - `icache` — inode 缓存，open addressing 哈希表
+  - `icache` — Swiss Table 风格，ctrl byte 快速过滤，只用 hash 匹配
   - `pcache` — 索引页缓存，4096 槽直接映射 + dirty 延迟写
   - `dcache` — 目录缓存，写回策略
 - **原地扩展** — 无需全量拷贝或 rehash
@@ -24,19 +24,23 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 
 ## 性能
 
-| 操作 | XXFS | ext4 | btrfs | XFS | NTFS-3G (FUSE) |
-|------|------|------|-------|-----|----------------|
-| create | 18.50 us | 9.63 us | 14.55 us | 7.77 us | 52.53 us |
-| stat | **0.35 us** | 1.11 us | 1.12 us | 0.72 us | 11.00 us |
-| read small | **0.37 us** | 2.88 us | 3.02 us | 2.33 us | 32.23 us |
-| unlink | **6.89 us** | 9.13 us | 12.88 us | 16.85 us | 17.35 us |
+| 操作 | XXFS | ext4 | btrfs |
+|------|------|------|-------|
+| create | **3.66 us** | 7.58 us | 9.46 us |
+| stat | **0.27 us** | 1.01 us | 0.80 us |
+| stat (random) | **0.27 us** | 0.97 us | 0.86 us |
+| read small | **0.30 us** | 3.51 us | 3.18 us |
+| read (random) | **0.25 us** | 2.90 us | 1.92 us |
+| mkdir | **5.83 us** | 14.58 us | 8.64 us |
+| unlink | **7.21 us** | 7.36 us | 10.71 us |
 
 *测试环境：10000 个文件，256MB 镜像，tmpfs 底层存储*
 
 **关键优势**：
-- stat/read 操作比所有内核文件系统快 **2-7x**
-- unlink 操作比所有对比文件系统快 **1.3-2.5x**
-- 比 FUSE 文件系统（NTFS-3G）快 **3-87x**
+
+- **create** 比 ext4 快 **2.1x**，比 btrfs 快 **2.6x**
+- **stat/read** 比所有内核文件系统快 **3.0-13.8x**
+- **mkdir** 比 ext4 快 **2.5x**，比 btrfs 快 **1.5x**
 
 ## 架构
 
@@ -44,8 +48,9 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 ┌─────────────────────────────────────────────┐
 │                 Application                  │
 ├─────────────────────────────────────────────┤
-│  icache  │  pcache (4096 slots, direct map) │
-│  dcache  │  dirty page writeback            │
+│  icache (Swiss Table)  │  pcache (4096)     │
+│  ctrl byte + hash only │  dirty writeback   │
+│  153 bytes/entry       │  direct mapped     │
 ├─────────────────────────────────────────────┤
 │           xxfs_lib (xxfs.c)                 │
 │  ┌─────────────────────────────────────────┐│
@@ -69,6 +74,7 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 ### Disk-Paged Hash 结构
 
 每个 4K 页面包含：
+
 - **Page Header** (16 bytes): count, local_depth, inline_used, overflow_next
 - **Slots** (56 × 48 bytes): hash, key_prefix, file_off, klen, vlen, flags
 - **Inline Area** (1344 bytes): 小 key-value 直接存储
@@ -86,6 +92,30 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 │ [key0][val0][key1][val1]...              │
 └──────────────────────────────────────────┘
 ```
+
+### Swiss Table 风格 icache
+
+```
+icache_entry {
+    u64 hash;        // xxh64 哈希值
+    u8  ctrl;        // 控制字节: 0x00=空, 0x80+低7位=有效
+    inode inode;     // 144 字节 inode 数据
+}
+
+查找流程:
+1. 计算 ctrl = (hash & 0x7F) | 0x80
+2. 直接索引: idx = hash & mask
+3. 探测最多 16 次:
+   - if (e->ctrl == EMPTY) return NOT_FOUND
+   - if (e->ctrl == ctrl && e->hash == hash) return FOUND
+   - idx = (idx + 1) & mask
+```
+
+**内存节省**：
+
+- 旧结构：432 字节/entry (hash + klen + key_prefix + key[256] + inode + lru_tick + valid)
+- 新结构：153 字节/entry (hash + ctrl + inode)
+- **节省 65% 内存**
 
 ### 磁盘布局
 
