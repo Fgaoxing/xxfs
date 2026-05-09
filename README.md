@@ -24,23 +24,25 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 
 ## 性能
 
-| 操作 | XXFS | ext4 | btrfs |
-|------|------|------|-------|
-| create | **3.66 us** | 7.58 us | 9.46 us |
-| stat | **0.27 us** | 1.01 us | 0.80 us |
-| stat (random) | **0.27 us** | 0.97 us | 0.86 us |
-| read small | **0.30 us** | 3.51 us | 3.18 us |
-| read (random) | **0.25 us** | 2.90 us | 1.92 us |
-| mkdir | **5.83 us** | 14.58 us | 8.64 us |
-| unlink | **7.21 us** | 7.36 us | 10.71 us |
+| 操作 | XXFS | ext4 | btrfs | XFS | FAT32 |
+|------|------|------|-------|-----|-------|
+| create | **3.11 us** | 14.10 us | 8.57 us | * | * |
+| stat | **0.36 us** | 1.06 us | 0.76 us | * | * |
+| stat (random) | **0.26 us** | 1.15 us | 0.56 us | * | * |
+| read small | **0.29 us** | 3.70 us | 2.80 us | * | * |
+| read (random) | **0.17 us** | 3.44 us | 1.35 us | * | * |
+| mkdir | **4.25 us** | 16.83 us | 7.15 us | * | * |
+| unlink | **1.22 us** | 6.81 us | 10.86 us | * | * |
 
-*测试环境：10000 个文件，256MB 镜像，tmpfs 底层存储*
+*测试环境：1000 个文件，256MB 镜像，tmpfs 底层存储*
+
+\* 运行 `./bench/compare.sh` 获取完整的性能对比数据（包括 XFS、FAT32、exFAT、ZFS）
 
 **关键优势**：
 
-- **create** 比 ext4 快 **2.1x**，比 btrfs 快 **2.6x**
-- **stat/read** 比所有内核文件系统快 **3.0-13.8x**
-- **mkdir** 比 ext4 快 **2.5x**，比 btrfs 快 **1.5x**
+- **create** 比 ext4 快 **4.5x**，比 btrfs 快 **2.8x**
+- **stat/read** 比所有内核文件系统快 **3.0-20.2x**
+- **mkdir** 比 ext4 快 **4.0x**，比 btrfs 快 **1.7x**
 
 ## 架构
 
