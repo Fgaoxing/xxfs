@@ -1,14 +1,22 @@
 # XXFS
 
-**eXtensible eXperimental Filesystem** — 一款高性能用户态哈希索引文件系统
+**eXtensible eXperimental Filesystem** — 基于 Disk-Paged Hash 的高性能用户态文件系统
+
+## 核心技术：Disk-Paged Hash
+
+XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化：
+
+- **页对齐存储** — 每个哈希桶是一个 4K 页面，与磁盘块对齐
+- **Inline Data** — 小文件（≤224字节）直接存储在索引页内，零额外 IO
+- **可扩展哈希** — Extendible Hashing，支持原地扩展，无需全量 rehash
+- **Dirty Page 写回** — 修改延迟写回，减少磁盘 IO 次数
 
 ## 特性
 
 - **零系统调用读写** — 用户态直接操作磁盘镜像，无需 VFS 路径
-- **Inline Data** — 小文件（≤224字节）直接存储在索引页内，零额外 IO
-- **Hash 索引** — 可扩展哈希（Extendible Hashing），点查 O(1)
-- **内存缓存** — 三级缓存架构：
-  - `icache` — inode 缓存，stat 命中 0.35 us
+- **Inline Data** — 小文件直接存储在索引页内，stat 命中 0.35 us
+- **三级缓存架构**：
+  - `icache` — inode 缓存，open addressing 哈希表
   - `pcache` — 索引页缓存，4096 槽直接映射 + dirty 延迟写
   - `dcache` — 目录缓存，写回策略
 - **原地扩展** — 无需全量拷贝或 rehash
@@ -16,14 +24,19 @@
 
 ## 性能
 
-| 操作 | XXFS | ext4 | btrfs | XFS |
-|------|------|------|-------|-----|
-| create | 18.50 us | 9.63 us | 14.55 us | 7.77 us |
-| stat | **0.35 us** | 1.11 us | 1.12 us | 0.72 us |
-| read small | **0.37 us** | 2.88 us | 3.02 us | 2.33 us |
-| unlink | **6.89 us** | 9.13 us | 12.88 us | 16.85 us |
+| 操作 | XXFS | ext4 | btrfs | XFS | NTFS-3G (FUSE) |
+|------|------|------|-------|-----|----------------|
+| create | 18.50 us | 9.63 us | 14.55 us | 7.77 us | 52.53 us |
+| stat | **0.35 us** | 1.11 us | 1.12 us | 0.72 us | 11.00 us |
+| read small | **0.37 us** | 2.88 us | 3.02 us | 2.33 us | 32.23 us |
+| unlink | **6.89 us** | 9.13 us | 12.88 us | 16.85 us | 17.35 us |
 
 *测试环境：10000 个文件，256MB 镜像，tmpfs 底层存储*
+
+**关键优势**：
+- stat/read 操作比所有内核文件系统快 **2-7x**
+- unlink 操作比所有对比文件系统快 **1.3-2.5x**
+- 比 FUSE 文件系统（NTFS-3G）快 **3-87x**
 
 ## 架构
 
@@ -35,15 +48,43 @@
 │  dcache  │  dirty page writeback            │
 ├─────────────────────────────────────────────┤
 │           xxfs_lib (xxfs.c)                 │
-│  ┌─────────┐  ┌──────────────┐  ┌────────┐ │
-│  │ Hash    │  │ Extendible   │  │  I/O   │ │
-│  │ (xxh64) │  │ Directory    │  │ Layer  │ │
-│  └─────────┘  └──────────────┘  └────────┘ │
+│  ┌─────────────────────────────────────────┐│
+│  │         Disk-Paged Hash                 ││
+│  │  ┌──────────┐  ┌──────────────────────┐ ││
+│  │  │ xxh64    │  │ Extendible Directory │ ││
+│  │  │ Hash     │  │ (256K entries max)   │ ││
+│  │  └──────────┘  └──────────────────────┘ ││
+│  │  ┌──────────────────────────────────────┐│
+│  │  │ Page Slots (56 per 4K page)         ││
+│  │  │ + Inline Area (1344 bytes)          ││
+│  │  └──────────────────────────────────────┘│
+│  └─────────────────────────────────────────┘│
 ├─────────────────────────────────────────────┤
 │         OS Abstraction (xxfs_os.c)          │
 ├─────────────────────────────────────────────┤
 │              Disk Image (.img)              │
 └─────────────────────────────────────────────┘
+```
+
+### Disk-Paged Hash 结构
+
+每个 4K 页面包含：
+- **Page Header** (16 bytes): count, local_depth, inline_used, overflow_next
+- **Slots** (56 × 48 bytes): hash, key_prefix, file_off, klen, vlen, flags
+- **Inline Area** (1344 bytes): 小 key-value 直接存储
+
+```
++──────────────────────────────────────────+
+│ Page Header (16B)                        │
+├──────────────────────────────────────────┤
+│ Slot[0]  │ hash(8) │ prefix(8) │ off(8)  │
+│          │ klen(4) │ vlen(4)   │ flags(1)│
+├──────────────────────────────────────────┤
+│ Slot[1] ... Slot[55]                     │
+├──────────────────────────────────────────┤
+│ Inline Area (1344B)                      │
+│ [key0][val0][key1][val1]...              │
+└──────────────────────────────────────────┘
 ```
 
 ### 磁盘布局
