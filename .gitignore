@@ -1,0 +1,23 @@
+# Build directories
+build/
+build_cmake/
+.xmake/
+
+# Temporary files
+*.img
+*.tmp
+/tmp/xxfs_bench*
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Perf and profiling
+*.data
+perf.data
