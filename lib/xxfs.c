@@ -2015,6 +2015,141 @@ int xxfs_sync(struct xxfs *fs)
     return XXFS_OK;
 }
 
+int xxfs_open(struct xxfs *fs, const char *path, u32 flags, struct xxfs_file **fp)
+{
+    if (!fs || !path || !fp)
+        return XXFS_EINVAL;
+    
+    char norm[XXFS_MAX_PATH];
+    u32 nlen;
+    path_normalize(path, norm, &nlen);
+    
+    fs_rlock(fs);
+    
+    u64 h = xxh64(norm, nlen);
+    struct icache_entry *ice = icache_lookup(fs, h, norm, nlen);
+    struct xxfs_inode ino;
+    u32 vlen = sizeof(ino);
+    
+    if (ice) {
+        xxfs_os_memcpy(&ino, &ice->inode, sizeof(ino));
+    } else {
+        if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+            fs_runlock(fs);
+            return XXFS_ENOENT;
+        }
+    }
+    
+    if (ino.i_file_type == XXFS_FT_DIR) {
+        fs_runlock(fs);
+        return XXFS_EISDIR;
+    }
+    
+    struct xxfs_file *f = xxfs_os_alloc(sizeof(*f));
+    if (!f) {
+        fs_runlock(fs);
+        return XXFS_ENOMEM;
+    }
+    
+    f->hash = h;
+    f->extent_off = ino.i_extent_off;
+    f->size = ino.i_size;
+    f->blocks = ino.i_blocks;
+    xxfs_os_memcpy(f->path, norm, nlen + 1);
+    f->path_len = nlen;
+    f->flags = flags;
+    
+    fs_runlock(fs);
+    
+    *fp = f;
+    return XXFS_OK;
+}
+
+int xxfs_close(struct xxfs *fs, struct xxfs_file *fp)
+{
+    if (!fs || !fp)
+        return XXFS_EINVAL;
+    
+    fs_wlock(fs);
+    
+    struct icache_entry *ice = icache_lookup(fs, fp->hash, fp->path, fp->path_len);
+    if (ice) {
+        ice->inode.i_size = fp->size;
+        ice->inode.i_blocks = fp->blocks;
+        ice->inode.i_mtime = xxfs_os_time();
+        ice->inode.i_ctime = ice->inode.i_mtime;
+        ice->inode.i_checksum = xxfs_os_crc32c(&ice->inode, INO_CRC_OFF);
+        
+        u8 val_buf[sizeof(struct xxfs_inode)];
+        inode_to_val(&ice->inode, val_buf);
+        paged_put(fs, fp->path, fp->path_len, val_buf, sizeof(struct xxfs_inode));
+    }
+    
+    xxfs_os_free(fp);
+    
+    fs_wunlock(fs);
+    return XXFS_OK;
+}
+
+ssize_t xxfs_write_fd(struct xxfs *fs, struct xxfs_file *fp, const void *buf, size_t count, u64 off)
+{
+    if (!fs || !fp || !buf || count == 0)
+        return XXFS_EINVAL;
+    
+    u64 end_off = off + count;
+    
+    if (end_off > XXFS_INLINE_MAX && fp->blocks == 0) {
+        fs_wlock(fs);
+        
+        u64 need_blocks = (end_off + XXFS_BLOCK_SIZE - 1) / XXFS_BLOCK_SIZE;
+        u64 new_off = page_alloc_n(fs, need_blocks);
+        if (!new_off) {
+            fs_wunlock(fs);
+            return XXFS_ENOSPC;
+        }
+        
+        fp->extent_off = new_off;
+        fp->blocks = need_blocks;
+        
+        fs_wunlock(fs);
+    } else if (end_off > fp->blocks * XXFS_BLOCK_SIZE) {
+        fs_wlock(fs);
+        
+        u64 need_blocks = (end_off + XXFS_BLOCK_SIZE - 1) / XXFS_BLOCK_SIZE;
+        u64 add_blocks = need_blocks - fp->blocks;
+        u64 new_off = page_alloc_n(fs, add_blocks);
+        if (!new_off) {
+            fs_wunlock(fs);
+            return XXFS_ENOSPC;
+        }
+        
+        if (fp->blocks > 0 && fp->extent_off) {
+            if (new_off != fp->extent_off + fp->blocks * XXFS_BLOCK_SIZE) {
+                u8 *tmp = xxfs_os_alloc((size_t)(fp->blocks * XXFS_BLOCK_SIZE));
+                if (tmp) {
+                    xxfs_os_file_pread(&fs->file, tmp, (size_t)(fp->blocks * XXFS_BLOCK_SIZE), (s64)fp->extent_off);
+                    xxfs_os_file_pwrite(&fs->file, tmp, (size_t)(fp->blocks * XXFS_BLOCK_SIZE), (s64)new_off);
+                    xxfs_os_free(tmp);
+                }
+            }
+        }
+        
+        fp->extent_off = new_off;
+        fp->blocks = need_blocks;
+        
+        fs_wunlock(fs);
+    }
+    
+    if (xxfs_os_file_pwrite(&fs->file, buf, count, (s64)(fp->extent_off + off))) {
+        return XXFS_EIO;
+    }
+    
+    if (end_off > fp->size)
+        fp->size = end_off;
+    
+    return (ssize_t)count;
+}
+
 int xxfs_mkfs(const char *path, u64 size_mb, u32 flags)
 {
     (void)flags;

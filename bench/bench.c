@@ -175,21 +175,31 @@ static int bench_rmdir(struct xxfs *fs, u32 n)
 static int bench_write_large(struct xxfs *fs, u32 block_count)
 {
     xxfs_create(fs, "/largefile", 0644, 0, 0);
+    
+    struct xxfs_file *fp;
+    xxfs_open(fs, "/largefile", 0, &fp);
+    
+    // Pre-allocate all space
+    u64 total_size = (u64)block_count * 4096;
+    u8 zero = 0;
+    xxfs_write_fd(fs, fp, &zero, 1, total_size - 1);
+    
     u8 block[4096];
     for (u32 i = 0; i < sizeof(block); i++)
         block[i] = (u8)(i & 0xFF);
 
     u64 t0 = now_ns();
     for (u32 i = 0; i < block_count; i++) {
-        u32 written;
-        xxfs_write(fs, "/largefile", block, (u64)i * 4096, 4096, &written);
+        xxfs_write_fd(fs, fp, block, 4096, (u64)i * 4096);
     }
     u64 t1 = now_ns();
+    
+    xxfs_close(fs, fp);
+    
     print_result("write 4K blocks (sequential)", t1 - t0, block_count);
 
-    u64 total_bytes = (u64)block_count * 4096;
     double sec = (double)(t1 - t0) / 1e9;
-    double mb_s = (double)total_bytes / (1024.0 * 1024.0) / sec;
+    double mb_s = (double)total_size / (1024.0 * 1024.0) / sec;
     printf("  throughput: %.2f MB/s\n", mb_s);
 
     xxfs_unlink(fs, "/largefile");

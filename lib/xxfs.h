@@ -10,6 +10,7 @@ typedef uint16_t u16;
 typedef uint8_t  u8;
 typedef int64_t  s64;
 typedef int32_t  s32;
+typedef s64      ssize_t;
 #if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
 typedef _Bool bool;
 #define true  1
@@ -274,6 +275,7 @@ struct xxfs_readdir_ctx {
 };
 
 struct xxfs;
+struct xxfs_file;
 
 struct xxfs_os_file {
     void *opaque[4];
@@ -337,6 +339,10 @@ void xxfs_readdir_free(struct xxfs_readdir_ctx *ctx);
 u64  xxfs_count(const struct xxfs *fs);
 int  xxfs_sync(struct xxfs *fs);
 
+int  xxfs_open(struct xxfs *fs, const char *path, u32 flags, struct xxfs_file **fp);
+int  xxfs_close(struct xxfs *fs, struct xxfs_file *fp);
+ssize_t xxfs_write_fd(struct xxfs *fs, struct xxfs_file *fp, const void *buf, size_t count, u64 off);
+
 struct xxfs_fs_info {
     u32 version;
     u32 block_size;
@@ -344,6 +350,16 @@ struct xxfs_fs_info {
     u64 free_blocks;
     u64 inodes_count;
     u64 cow_generation;
+};
+
+struct xxfs_file {
+    u64 hash;
+    u64 extent_off;
+    u64 size;
+    u64 blocks;
+    char path[XXFS_MAX_PATH];
+    u32 path_len;
+    u32 flags;
 };
 
 int  xxfs_info(const struct xxfs *fs, struct xxfs_fs_info *info);
