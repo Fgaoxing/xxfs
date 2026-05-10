@@ -40,6 +40,7 @@ static void pcache_flush_all(struct xxfs *fs);
 static void xxfs_mmap_refresh(struct xxfs *fs);
 static int paged_put(struct xxfs *fs, const void *key, u32 klen,
                      const void *val, u32 vlen);
+static void inode_to_val(const struct xxfs_inode *ino, void *buf);
 
 #define DPHASH_OK 0
 #define DPHASH_ENOENT -2
@@ -128,6 +129,9 @@ struct paged_cache {
 struct icache_entry {
     u64 hash;
     u8 ctrl;
+    u8 dirty;
+    u32 klen;
+    char key[XXFS_MAX_PATH];
     struct xxfs_inode inode;
 };
 
@@ -240,7 +244,17 @@ static void icache_evict_one(struct xxfs *fs)
     for (u32 probe = 0; probe < fs->icache_cap; probe++) {
         struct icache_entry *e = &fs->icache[idx];
         if (e->ctrl != ICACHE_CTRL_EMPTY) {
+            if (e->dirty) {
+                e->inode.i_mtime = xxfs_os_time();
+                e->inode.i_ctime = e->inode.i_mtime;
+                e->inode.i_checksum = xxfs_os_crc32c(&e->inode, INO_CRC_OFF);
+                
+                u8 val_buf[sizeof(struct xxfs_inode)];
+                inode_to_val(&e->inode, val_buf);
+                paged_put(fs, e->key, e->klen, val_buf, sizeof(struct xxfs_inode));
+            }
             e->ctrl = ICACHE_CTRL_EMPTY;
+            e->dirty = 0;
             fs->icache_count--;
             return;
         }
@@ -288,11 +302,15 @@ static void icache_put(struct xxfs *fs, u64 hash, const char *key, u32 klen,
         if (fs->icache[idx].ctrl == ICACHE_CTRL_EMPTY) {
             fs->icache[idx].hash = hash;
             fs->icache[idx].ctrl = ctrl;
+            fs->icache[idx].dirty = 1;
+            fs->icache[idx].klen = klen;
+            xxfs_os_memcpy(fs->icache[idx].key, key, klen + 1);
             xxfs_os_memcpy(&fs->icache[idx].inode, ino, sizeof(*ino));
             fs->icache_count++;
             return;
         }
         if (fs->icache[idx].hash == hash) {
+            fs->icache[idx].dirty = 1;
             xxfs_os_memcpy(&fs->icache[idx].inode, ino, sizeof(*ino));
             return;
         }
@@ -812,6 +830,26 @@ static void page_writeback(struct xxfs *fs, struct paged_page *pg, u64 off)
     PROF_BEGIN();
     xxfs_os_file_pwrite(&fs->file, pg, sizeof(struct paged_page), (s64)off);
     PROF_ADD(fs, prof_pwrite_ns);
+}
+
+static void icache_flush_all(struct xxfs *fs)
+{
+    if (!fs->icache)
+        return;
+    
+    for (u32 i = 0; i < fs->icache_cap; i++) {
+        struct icache_entry *e = &fs->icache[i];
+        if (e->ctrl != ICACHE_CTRL_EMPTY && (e->ctrl & ICACHE_CTRL_VALID) && e->dirty) {
+            e->inode.i_mtime = xxfs_os_time();
+            e->inode.i_ctime = e->inode.i_mtime;
+            e->inode.i_checksum = xxfs_os_crc32c(&e->inode, INO_CRC_OFF);
+            
+            u8 val_buf[sizeof(struct xxfs_inode)];
+            inode_to_val(&e->inode, val_buf);
+            paged_put(fs, e->key, e->klen, val_buf, sizeof(struct xxfs_inode));
+            e->dirty = 0;
+        }
+    }
 }
 
 static void pcache_flush_all(struct xxfs *fs)
@@ -2006,6 +2044,7 @@ int xxfs_sync(struct xxfs *fs)
     if (!fs)
         return XXFS_EINVAL;
     fs_wlock(fs);
+    icache_flush_all(fs);
     dcache_flush_all(fs);
     pcache_flush_all(fs);
     super_write(fs);
