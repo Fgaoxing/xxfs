@@ -1457,18 +1457,10 @@ int xxfs_create(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     PROF_ADD(fs, prof_pcache_ns);
 
     if (rc == XXFS_OK) {
-        PROF_BEGIN();
         icache_put(fs, h, norm, nlen, &ino);
-        PROF_ADD(fs, prof_icache_ns);
-
-        PROF_BEGIN();
         dir_add_child(fs, parent, plen, name, XXFS_FT_REG);
-        PROF_ADD(fs, prof_dcache_ns);
-
         fs->sb.s_inodes_count++;
         fs->sb.s_free_inodes--;
-        if (fs->flags & XXFS_FLAG_SYNC)
-            super_write(fs);
     }
 
 #ifdef XXFS_PROFILE
@@ -1496,19 +1488,14 @@ int xxfs_mkdir(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     }
 
     struct xxfs_inode ino;
-    memset(&ino, 0, sizeof(ino));
+    u64 *p = (u64 *)&ino;
+    for (int i = 0; i < (int)(sizeof(ino) / 8); i++)
+        p[i] = 0;
     ino.i_mode = mode;
     ino.i_uid = uid;
     ino.i_gid = gid;
     ino.i_file_type = XXFS_FT_DIR;
     ino.i_nlinks = 2;
-    ino.i_size = 0;
-    ino.i_blocks = 0;
-    u64 now = xxfs_os_time();
-    ino.i_atime = now;
-    ino.i_mtime = now;
-    ino.i_ctime = now;
-    ino.i_btime = now;
     ino.i_generation = fs->cow_gen;
 
     const char *name = get_basename(norm, nlen);
@@ -1522,8 +1509,6 @@ int xxfs_mkdir(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     u32 plen;
     get_parent_path(norm, nlen, parent, &plen);
 
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
-
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
     int rc = paged_insert(fs, norm, nlen, val_buf, sizeof(struct xxfs_inode));
@@ -1532,8 +1517,6 @@ int xxfs_mkdir(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
         icache_put(fs, h, norm, nlen, &ino);
         dir_add_child(fs, parent, plen, name, XXFS_FT_DIR);
         fs->sb.s_inodes_count++;
-        if (fs->flags & XXFS_FLAG_SYNC)
-            super_write(fs);
     }
 
     fs_wunlock(fs);
@@ -1579,8 +1562,6 @@ int xxfs_unlink(struct xxfs *fs, const char *path)
         const char *bname = get_basename(norm, nlen);
         dir_remove_child(fs, parent, plen, bname);
         fs->sb.s_inodes_count--;
-        if (fs->flags & XXFS_FLAG_SYNC)
-            super_write(fs);
     }
 
     fs_wunlock(fs);
@@ -1698,19 +1679,12 @@ int xxfs_write(struct xxfs *fs, const char *path, const void *buf, u64 off, u32 
         xxfs_os_memcpy(ino.i_inline + off, buf, len);
         if (end_off > ino.i_size)
             ino.i_size = end_off;
-        ino.i_mtime = xxfs_os_time();
-        ino.i_ctime = ino.i_mtime;
-        ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
-
-        u8 val_buf[sizeof(struct xxfs_inode)];
-        inode_to_val(&ino, val_buf);
-        int rc = paged_put(fs, norm, nlen, val_buf, sizeof(struct xxfs_inode));
-        if (rc == XXFS_OK && written)
+        
+        icache_put(fs, h, norm, nlen, &ino);
+        if (written)
             *written = len;
-        if (rc == XXFS_OK)
-            icache_put(fs, h, norm, nlen, &ino);
         fs_wunlock(fs);
-        return rc;
+        return XXFS_OK;
     }
 
     if (ino.i_size > 0 && ino.i_blocks == 0) {
