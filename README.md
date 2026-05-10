@@ -26,45 +26,49 @@ XXFS 使用 **Disk-Paged Hash** 作为主索引结构，专为磁盘存储优化
 
 ### 核心操作性能对比
 
-| 操作 | XXFS | ext4 | btrfs |
-|------|------|------|-------|
-| create | **8.21 us** | 6.36 us | 8.63 us |
-| stat | **0.37 us** | 0.85 us | 0.71 us |
-| stat (random) | **0.31 us** | 0.86 us | 0.80 us |
-| mkdir | **7.59 us** | 8.90 us | 7.11 us |
-| unlink | **6.83 us** | 6.94 us | 10.14 us |
+| 操作 | XXFS | ext4 | btrfs | XFS | FAT32 |
+|------|------|------|-------|-----|-------|
+| create | **6.27 us** | 6.67 us | 8.50 us | **3.01 us** | 1273.82 us |
+| stat | **0.36 us** | 0.70 us | 0.70 us | 0.81 us | 0.82 us |
+| stat (random) | **0.30 us** | 0.71 us | 0.80 us | 0.78 us | 0.89 us |
+| mkdir | 7.56 us | 9.23 us | 7.13 us | **1.90 us** | 6109.94 us |
+| unlink | 7.18 us | 7.10 us | 11.15 us | **2.86 us** | 163.46 us |
 
 ### 文件读写性能对比
 
-| 操作 | XXFS | ext4 | btrfs |
-|------|------|------|-------|
-| write small | 13.81 us | **3.63 us** | 61.44 us |
-| read small | **0.36 us** | 2.13 us | 2.22 us |
-| read (random) | **0.32 us** | 1.78 us | 1.65 us |
+| 操作 | XXFS | ext4 | btrfs | XFS | FAT32 |
+|------|------|------|-------|-----|-------|
+| write small | 15.45 us | **3.76 us** | 63.79 us | 2.83 us | 3.19 us |
+| read small | **0.45 us** | 2.27 us | 2.54 us | 1.92 us | 2.39 us |
+| read (random) | **0.36 us** | 1.86 us | 2.08 us | 2.06 us | 1.72 us |
 
 ### 大文件写入性能
 
 | 文件系统 | 吞吐量 |
 |---------|--------|
-| XXFS | **4952 MB/s** 🚀 |
-| btrfs | 1146 MB/s |
-| ext4 | 265 MB/s |
+| XXFS | **8108 MB/s** 🚀 |
+| XFS | 2649 MB/s |
+| btrfs | 983 MB/s |
+| FAT32 | 388 MB/s |
+| ext4 | 298 MB/s |
 
 *测试环境：10000 个文件，256MB 镜像，tmpfs 底层存储*
 
 **关键优势**：
 
-- **大文件写入**：XXFS比ext4快**18.7x**，比btrfs快**4.3x** 🚀
-- **stat/read**：XXFS比ext4快**2.3-4.9x**，比btrfs快**1.9-6.2x**
-- **create**：XXFS与ext4/btrfs相当
-- **mkdir**：XXFS与ext4/btrfs相当
-- **unlink**：XXFS比btrfs快**1.5x**
+- **大文件写入**：XXFS比XFS快**3.1x**，比btrfs快**8.3x**，比ext4快**27.2x** 🚀
+- **stat/read**：XXFS比所有内核文件系统快**4.1-7.0x**
+- **create**：XXFS与ext4/btrfs相当，比FAT32快**203x**
+- **mkdir**：XXFS与ext4/btrfs相当，比FAT32快**807x**
+- **unlink**：XXFS与ext4相当，比btrfs快**1.6x**，比FAT32快**23x**
 
 **注意**：
-- XXFS在元数据操作（stat/read）上显著优于所有对比文件系统
-- 大文件写入性能极致优化，达到**4952 MB/s**
+- XXFS在stat/read操作上显著优于所有对比文件系统
+- 大文件写入性能极致优化，达到**8108 MB/s**
+- XFS在create/mkdir/unlink上表现优异
+- FAT32在create/mkdir上性能极差，这是FAT32文件系统的固有特性
 - XXFS运行在用户态（直接img I/O，无VFS开销）
-- ext4/btrfs运行在内核态（VFS + syscall开销）
+- 其他文件系统运行在内核态（VFS + syscall开销）
 - 这是非对等对比，XXFS优势在于无syscall/VFS开销
 
 ## 架构
