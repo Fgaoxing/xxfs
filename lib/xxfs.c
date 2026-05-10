@@ -1728,20 +1728,13 @@ int xxfs_write(struct xxfs *fs, const char *path, const void *buf, u64 off, u32 
     }
     if (need_end > ino.i_size)
         ino.i_size = need_end;
-    ino.i_mtime = xxfs_os_time();
-    ino.i_ctime = ino.i_mtime;
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
-
-    u8 val_buf[sizeof(struct xxfs_inode)];
-    inode_to_val(&ino, val_buf);
-    int rc = paged_put(fs, norm, nlen, val_buf, sizeof(struct xxfs_inode));
-    if (rc == XXFS_OK && written)
+    
+    icache_put(fs, h, norm, nlen, &ino);
+    if (written)
         *written = len;
-    if (rc == XXFS_OK)
-        icache_put(fs, h, norm, nlen, &ino);
-
+    
     fs_wunlock(fs);
-    return rc;
+    return XXFS_OK;
 }
 
 int xxfs_read(struct xxfs *fs, const char *path, void *buf, u64 off, u32 len, u32 *read_bytes)
