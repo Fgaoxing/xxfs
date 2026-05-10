@@ -131,7 +131,7 @@ struct icache_entry {
     u8 ctrl;
     u8 dirty;
     u32 klen;
-    char key[XXFS_MAX_PATH];
+    char *key;
     struct xxfs_inode inode;
 };
 
@@ -218,6 +218,12 @@ static void icache_init(struct xxfs *fs)
 static void icache_destroy(struct xxfs *fs)
 {
     if (fs->icache) {
+        for (u32 i = 0; i < fs->icache_cap; i++) {
+            if (fs->icache[i].key) {
+                xxfs_os_free(fs->icache[i].key);
+                fs->icache[i].key = NULL;
+            }
+        }
         xxfs_os_free(fs->icache);
         fs->icache = NULL;
     }
@@ -252,6 +258,10 @@ static void icache_evict_one(struct xxfs *fs)
                 u8 val_buf[sizeof(struct xxfs_inode)];
                 inode_to_val(&e->inode, val_buf);
                 paged_put(fs, e->key, e->klen, val_buf, sizeof(struct xxfs_inode));
+            }
+            if (e->key) {
+                xxfs_os_free(e->key);
+                e->key = NULL;
             }
             e->ctrl = ICACHE_CTRL_EMPTY;
             e->dirty = 0;
@@ -304,7 +314,9 @@ static void icache_put(struct xxfs *fs, u64 hash, const char *key, u32 klen,
             fs->icache[idx].ctrl = ctrl;
             fs->icache[idx].dirty = 1;
             fs->icache[idx].klen = klen;
-            xxfs_os_memcpy(fs->icache[idx].key, key, klen + 1);
+            fs->icache[idx].key = xxfs_os_alloc(klen + 1);
+            if (fs->icache[idx].key)
+                xxfs_os_memcpy(fs->icache[idx].key, key, klen + 1);
             xxfs_os_memcpy(&fs->icache[idx].inode, ino, sizeof(*ino));
             fs->icache_count++;
             return;
@@ -322,7 +334,12 @@ static void icache_del(struct xxfs *fs, u64 hash, const char *key, u32 klen)
 {
     struct icache_entry *e = icache_lookup(fs, hash, key, klen);
     if (e) {
+        if (e->key) {
+            xxfs_os_free(e->key);
+            e->key = NULL;
+        }
         e->ctrl = ICACHE_CTRL_EMPTY;
+        e->dirty = 0;
         fs->icache_count--;
     }
 }
@@ -331,7 +348,12 @@ static void icache_invalidate(struct xxfs *fs, u64 hash, const char *key, u32 kl
 {
     struct icache_entry *e = icache_lookup(fs, hash, key, klen);
     if (e) {
+        if (e->key) {
+            xxfs_os_free(e->key);
+            e->key = NULL;
+        }
         e->ctrl = ICACHE_CTRL_EMPTY;
+        e->dirty = 0;
         fs->icache_count--;
     }
 }
@@ -1449,6 +1471,8 @@ int xxfs_create(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     u32 plen;
     get_parent_path(norm, nlen, parent, &plen);
 
+    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
 
@@ -1508,6 +1532,8 @@ int xxfs_mkdir(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     char parent[XXFS_MAX_PATH];
     u32 plen;
     get_parent_path(norm, nlen, parent, &plen);
+
+    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
 
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);

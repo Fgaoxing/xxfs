@@ -179,10 +179,31 @@ static void crc32c_init(void)
 
 u32 xxfs_os_crc32c(const void *data, size_t len)
 {
+#ifdef __SSE4_2__
+    const u8 *p = (const u8 *)data;
+    u64 crc = 0xFFFFFFFFUL;
+    while (len >= 8) {
+        crc = __builtin_ia32_crc32di((u32)crc, *(const u64 *)p);
+        p += 8;
+        len -= 8;
+    }
+    while (len >= 4) {
+        crc = __builtin_ia32_crc32si((u32)crc, *(const u32 *)p);
+        p += 4;
+        len -= 4;
+    }
+    while (len > 0) {
+        crc = __builtin_ia32_crc32qi((u32)crc, *p);
+        p++;
+        len--;
+    }
+    return (u32)(crc ^ 0xFFFFFFFFUL);
+#else
     crc32c_init();
     const u8 *p = (const u8 *)data;
     u32 crc = 0xFFFFFFFFU;
     for (size_t i = 0; i < len; i++)
         crc = crc32c_table[(crc ^ p[i]) & 0xFF] ^ (crc >> 8);
     return crc ^ 0xFFFFFFFFU;
+#endif
 }
