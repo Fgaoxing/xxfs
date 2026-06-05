@@ -6,6 +6,8 @@
 #include <string.h>
 
 #define INO_CRC_OFF ((u32)((size_t)&((struct xxfs_inode *)0)->i_checksum))
+#define INO_ECC_OFF ((u32)((size_t)&((struct xxfs_inode *)0)->i_ecc))
+#define INO_ECC_LEN XXFS_ECC_INODE_SIZE
 
 #define fs_wlock(fs)                           \
     do {                                       \
@@ -244,6 +246,31 @@ static struct icache_entry *icache_lookup(struct xxfs *fs, u64 hash, const char 
     return NULL;
 }
 
+/* 写入inode时计算CRC和ECC */
+static void inode_set_checksum_ecc(struct xxfs_inode *ino)
+{
+    ino->i_checksum = xxfs_os_crc32c(ino, INO_CRC_OFF);
+    xxfs_os_ecc_compute(ino, INO_ECC_OFF, ino->i_ecc);
+}
+
+/* 读取inode时校验，CRC失败则尝试ECC静默纠错 */
+static int inode_verify_ecc(struct xxfs_inode *ino)
+{
+    u32 crc = xxfs_os_crc32c(ino, INO_CRC_OFF);
+    if (likely(crc == ino->i_checksum))
+        return XXFS_ECC_OK;
+
+    /* CRC失败，尝试ECC静默纠错 */
+    int rc = xxfs_os_ecc_correct(ino, INO_ECC_OFF, ino->i_ecc);
+    if (rc == XXFS_ECC_CORRECTED) {
+        /* 纠错成功，验证CRC */
+        u32 crc2 = xxfs_os_crc32c(ino, INO_CRC_OFF);
+        if (crc2 == ino->i_checksum)
+            return XXFS_ECC_CORRECTED;
+    }
+    return XXFS_ECC_UNCORRECTABLE;
+}
+
 static void icache_evict_one(struct xxfs *fs)
 {
     u32 idx = (u32)(fs->icache_tick & fs->icache_mask);
@@ -253,7 +280,7 @@ static void icache_evict_one(struct xxfs *fs)
             if (e->dirty) {
                 e->inode.i_mtime = xxfs_os_time();
                 e->inode.i_ctime = e->inode.i_mtime;
-                e->inode.i_checksum = xxfs_os_crc32c(&e->inode, INO_CRC_OFF);
+                inode_set_checksum_ecc(&e->inode);
                 
                 u8 val_buf[sizeof(struct xxfs_inode)];
                 inode_to_val(&e->inode, val_buf);
@@ -864,8 +891,8 @@ static void icache_flush_all(struct xxfs *fs)
         if (e->ctrl != ICACHE_CTRL_EMPTY && (e->ctrl & ICACHE_CTRL_VALID) && e->dirty) {
             e->inode.i_mtime = xxfs_os_time();
             e->inode.i_ctime = e->inode.i_mtime;
-            e->inode.i_checksum = xxfs_os_crc32c(&e->inode, INO_CRC_OFF);
-            
+            inode_set_checksum_ecc(&e->inode);
+
             u8 val_buf[sizeof(struct xxfs_inode)];
             inode_to_val(&e->inode, val_buf);
             paged_put(fs, e->key, e->klen, val_buf, sizeof(struct xxfs_inode));
@@ -1268,6 +1295,7 @@ static void super_write(struct xxfs *fs)
     pdir_write(fs);
     u32 off = (u32)((char *)&fs->sb.s_checksum - (char *)&fs->sb);
     fs->sb.s_checksum = xxfs_os_crc32c(&fs->sb, off);
+    xxfs_os_ecc_compute(&fs->sb, (size_t)off, fs->sb.s_ecc);
     xxfs_os_file_pwrite(&fs->file, &fs->sb, sizeof(fs->sb), 0);
 }
 
@@ -1278,8 +1306,19 @@ static int super_read(struct xxfs *fs)
         return XXFS_EIO;
     u32 off = (u32)((char *)&fs->sb.s_checksum - (char *)&fs->sb);
     u32 crc = xxfs_os_crc32c(&fs->sb, off);
-    if (crc != fs->sb.s_checksum)
-        return XXFS_EIO;
+    if (crc == fs->sb.s_checksum)
+        goto ok;
+    /* CRC失败，尝试ECC静默纠错 */
+    if (xxfs_os_ecc_correct(&fs->sb, (size_t)off, fs->sb.s_ecc) == XXFS_ECC_CORRECTED) {
+        u32 crc2 = xxfs_os_crc32c(&fs->sb, off);
+        if (crc2 == fs->sb.s_checksum) {
+            /* 纠错成功，写回修复后的superblock */
+            xxfs_os_file_pwrite(&fs->file, &fs->sb, sizeof(fs->sb), 0);
+            goto ok;
+        }
+    }
+    return XXFS_EIO;
+ok:
     if (fs->sb.s_magic != XXFS_MAGIC)
         return XXFS_EIO;
     return XXFS_OK;
@@ -1320,6 +1359,18 @@ static void inode_to_val(const struct xxfs_inode *ino, void *buf)
 static void val_to_inode(const void *buf, struct xxfs_inode *ino)
 {
     xxfs_os_memcpy(ino, buf, sizeof(struct xxfs_inode));
+}
+
+/* 从paged hash读取inode并做ECC校验，CRC失败静默纠错 */
+static int inode_paged_get(struct xxfs *fs, const char *key, u32 klen,
+                           struct xxfs_inode *ino)
+{
+    u32 vlen = sizeof(struct xxfs_inode);
+    int rc = paged_get(fs, key, klen, ino, &vlen);
+    if (rc != XXFS_OK)
+        return rc;
+    inode_verify_ecc(ino);
+    return XXFS_OK;
 }
 
 struct xxfs *xxfs_mount(const char *path, u64 flags)
@@ -1471,7 +1522,7 @@ int xxfs_create(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     u32 plen;
     get_parent_path(norm, nlen, parent, &plen);
 
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
 
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
@@ -1533,7 +1584,7 @@ int xxfs_mkdir(struct xxfs *fs, const char *path, u16 mode, u16 uid, u16 gid)
     u32 plen;
     get_parent_path(norm, nlen, parent, &plen);
 
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
 
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
@@ -1562,12 +1613,11 @@ int xxfs_unlink(struct xxfs *fs, const char *path)
     u64 h = xxh64(norm, nlen);
     struct icache_entry *ice = icache_lookup(fs, h, norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
 
     if (ice) {
         xxfs_os_memcpy(&ino, &ice->inode, sizeof(ino));
     } else {
-        if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+        if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
             fs_wunlock(fs);
             return XXFS_ENOENT;
         }
@@ -1610,12 +1660,11 @@ int xxfs_rmdir(struct xxfs *fs, const char *path)
     u64 h = xxh64(norm, nlen);
     struct icache_entry *ice = icache_lookup(fs, h, norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
 
     if (ice) {
         xxfs_os_memcpy(&ino, &ice->inode, sizeof(ino));
     } else {
-        if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+        if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
             fs_wunlock(fs);
             return XXFS_ENOENT;
         }
@@ -1662,8 +1711,7 @@ int xxfs_stat(struct xxfs *fs, const char *path, struct xxfs_inode *out)
         return XXFS_OK;
     }
 
-    u32 vlen = sizeof(struct xxfs_inode);
-    int rc = paged_get(fs, norm, nlen, out, &vlen);
+    int rc = inode_paged_get(fs, norm, nlen, out);
     if (rc == XXFS_OK)
         icache_put(fs, h, norm, nlen, out);
 
@@ -1684,12 +1732,11 @@ int xxfs_write(struct xxfs *fs, const char *path, const void *buf, u64 off, u32 
     u64 h = xxh64(norm, nlen);
     struct icache_entry *ice = icache_lookup(fs, h, norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
 
     if (ice) {
         xxfs_os_memcpy(&ino, &ice->inode, sizeof(ino));
     } else {
-        if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+        if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
             fs_wunlock(fs);
             return XXFS_ENOENT;
         }
@@ -1792,8 +1839,7 @@ int xxfs_read(struct xxfs *fs, const char *path, void *buf, u64 off, u32 len, u3
     if (ice) {
         xxfs_os_memcpy(&ino, &ice->inode, sizeof(ino));
     } else {
-        u32 vlen = sizeof(ino);
-        if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+        if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
             fs_runlock(fs);
             return XXFS_ENOENT;
         }
@@ -1845,14 +1891,13 @@ int xxfs_chmod(struct xxfs *fs, const char *path, u16 mode)
     fs_wlock(fs);
     u64 h = xxh64(norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+    if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
         fs_wunlock(fs);
         return XXFS_ENOENT;
     }
     ino.i_mode = mode;
     ino.i_ctime = xxfs_os_time();
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
     int rc = paged_put(fs, norm, nlen, val_buf, sizeof(struct xxfs_inode));
@@ -1873,15 +1918,14 @@ int xxfs_chown(struct xxfs *fs, const char *path, u16 uid, u16 gid)
     fs_wlock(fs);
     u64 h = xxh64(norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+    if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
         fs_wunlock(fs);
         return XXFS_ENOENT;
     }
     ino.i_uid = uid;
     ino.i_gid = gid;
     ino.i_ctime = xxfs_os_time();
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
     int rc = paged_put(fs, norm, nlen, val_buf, sizeof(struct xxfs_inode));
@@ -1902,15 +1946,14 @@ int xxfs_utime(struct xxfs *fs, const char *path, u64 atime, u64 mtime)
     fs_wlock(fs);
     u64 h = xxh64(norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+    if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
         fs_wunlock(fs);
         return XXFS_ENOENT;
     }
     ino.i_atime = atime;
     ino.i_mtime = mtime;
     ino.i_ctime = xxfs_os_time();
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
     int rc = paged_put(fs, norm, nlen, val_buf, sizeof(struct xxfs_inode));
@@ -1935,8 +1978,7 @@ int xxfs_rename(struct xxfs *fs, const char *old_path, const char *new_path)
     u64 new_h = xxh64(new_norm, nlen);
 
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    if (paged_get(fs, old_norm, olen, &ino, &vlen) != XXFS_OK) {
+    if (inode_paged_get(fs, old_norm, olen, &ino) != XXFS_OK) {
         fs_wunlock(fs);
         return XXFS_ENOENT;
     }
@@ -1950,7 +1992,7 @@ int xxfs_rename(struct xxfs *fs, const char *old_path, const char *new_path)
         name_len = XXFS_MAX_NAME;
     xxfs_os_memcpy(ino.i_name, name, name_len);
     ino.i_name[name_len] = 0;
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
 
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
@@ -1986,8 +2028,7 @@ int xxfs_symlink(struct xxfs *fs, const char *target, const char *linkpath)
     u64 h = xxh64(norm, nlen);
     struct icache_entry *ice = icache_lookup(fs, h, norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    if (ice || paged_get(fs, norm, nlen, &ino, &vlen) == XXFS_OK) {
+    if (ice || inode_paged_get(fs, norm, nlen, &ino) == XXFS_OK) {
         if (!ice)
             icache_put(fs, h, norm, nlen, &ino);
         fs_wunlock(fs);
@@ -2004,7 +2045,7 @@ int xxfs_symlink(struct xxfs *fs, const char *target, const char *linkpath)
     ino.i_ctime = now;
     ino.i_btime = now;
     xxfs_os_memcpy(ino.i_inline, target, tlen);
-    ino.i_checksum = xxfs_os_crc32c(&ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&ino);
 
     u8 val_buf[sizeof(struct xxfs_inode)];
     inode_to_val(&ino, val_buf);
@@ -2054,6 +2095,30 @@ int xxfs_sync(struct xxfs *fs)
     return XXFS_OK;
 }
 
+int xxfs_sync_file(struct xxfs *fs)
+{
+    if (!fs)
+        return XXFS_EINVAL;
+    return xxfs_os_file_sync(&fs->file);
+}
+
+ssize_t xxfs_read_fd(struct xxfs *fs, struct xxfs_file *fp, void *buf, size_t count, u64 off)
+{
+    if (!fs || !fp || !buf || count == 0)
+        return XXFS_EINVAL;
+    u64 end_off = off + count;
+    if (off >= fp->size) {
+        memset(buf, 0, count);
+        return 0;
+    }
+    u64 avail = fp->size - off;
+    if (count > avail)
+        count = (size_t)avail;
+    if (xxfs_os_file_pread(&fs->file, buf, count, (s64)(fp->extent_off + off)) < 0)
+        return XXFS_EIO;
+    return (ssize_t)count;
+}
+
 int xxfs_open(struct xxfs *fs, const char *path, u32 flags, struct xxfs_file **fp)
 {
     if (!fs || !path || !fp)
@@ -2068,12 +2133,11 @@ int xxfs_open(struct xxfs *fs, const char *path, u32 flags, struct xxfs_file **f
     u64 h = xxh64(norm, nlen);
     struct icache_entry *ice = icache_lookup(fs, h, norm, nlen);
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    
+
     if (ice) {
         xxfs_os_memcpy(&ino, &ice->inode, sizeof(ino));
     } else {
-        if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+        if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
             fs_runlock(fs);
             return XXFS_ENOENT;
         }
@@ -2117,7 +2181,7 @@ int xxfs_close(struct xxfs *fs, struct xxfs_file *fp)
         ice->inode.i_blocks = fp->blocks;
         ice->inode.i_mtime = xxfs_os_time();
         ice->inode.i_ctime = ice->inode.i_mtime;
-        ice->inode.i_checksum = xxfs_os_crc32c(&ice->inode, INO_CRC_OFF);
+        inode_set_checksum_ecc(&ice->inode);
         
         u8 val_buf[sizeof(struct xxfs_inode)];
         inode_to_val(&ice->inode, val_buf);
@@ -2191,23 +2255,39 @@ ssize_t xxfs_write_fd(struct xxfs *fs, struct xxfs_file *fp, const void *buf, si
 
 int xxfs_mkfs(const char *path, u64 size_mb, u32 flags)
 {
-    (void)flags;
-    if (!path || size_mb < 1)
+    int is_blkdev = (flags & 0x100) != 0;
+
+    if (!path)
         return XXFS_EINVAL;
 
     struct xxfs_os_file f;
-    if (xxfs_os_file_open(&f, path, 3))
-        return XXFS_EIO;
+    if (is_blkdev) {
+        if (xxfs_os_file_open(&f, path, 0))
+            return XXFS_EIO;
+        s64 dev_size = xxfs_os_file_size(&f);
+        if (dev_size <= 0) {
+            xxfs_os_file_close(&f);
+            return XXFS_EIO;
+        }
+        size_mb = (u64)(dev_size / (1024ULL * 1024ULL));
+        if (size_mb < 1)
+            size_mb = 1;
+    } else {
+        if (size_mb < 1)
+            return XXFS_EINVAL;
+        if (xxfs_os_file_open(&f, path, 3))
+            return XXFS_EIO;
+        u64 total_bytes = size_mb * 1024ULL * 1024ULL;
+        if (xxfs_os_file_truncate(&f, (s64)total_bytes)) {
+            xxfs_os_file_close(&f);
+            return XXFS_EIO;
+        }
+    }
 
     u64 total_bytes = size_mb * 1024ULL * 1024ULL;
     u64 total_blocks = total_bytes / XXFS_BLOCK_SIZE;
     if (total_blocks < 100)
         total_blocks = 100;
-
-    if (xxfs_os_file_truncate(&f, (s64)total_bytes)) {
-        xxfs_os_file_close(&f);
-        return XXFS_EIO;
-    }
 
     struct xxfs_super sb;
     memset(&sb, 0, sizeof(sb));
@@ -2257,7 +2337,7 @@ int xxfs_mkfs(const char *path, u64 size_mb, u32 flags)
     root_ino.i_btime = sb.s_mtime;
     root_ino.i_generation = 1;
     xxfs_os_memcpy(root_ino.i_name, "/", 2);
-    root_ino.i_checksum = xxfs_os_crc32c(&root_ino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&root_ino);
 
     u64 rec_off = sb.s_data_off;
     u8 rec_hdr[8];
@@ -2310,8 +2390,7 @@ static void dcache_flush_entry(struct xxfs *fs, struct dir_cache_entry *e)
     if (ice) {
         xxfs_os_memcpy(&dino, &ice->inode, sizeof(dino));
     } else {
-        u32 vlen = sizeof(dino);
-        if (paged_get(fs, e->path, e->path_len, &dino, &vlen) != XXFS_OK)
+        if (inode_paged_get(fs, e->path, e->path_len, &dino) != XXFS_OK)
             return;
     }
     if (e->child_count == 0) {
@@ -2340,7 +2419,7 @@ static void dcache_flush_entry(struct xxfs *fs, struct dir_cache_entry *e)
     }
     dino.i_mtime = xxfs_os_time();
     dino.i_ctime = dino.i_mtime;
-    dino.i_checksum = xxfs_os_crc32c(&dino, INO_CRC_OFF);
+    inode_set_checksum_ecc(&dino);
     u8 val_buf[sizeof(struct xxfs_inode)];
     xxfs_os_memcpy(val_buf, &dino, sizeof(dino));
     int rc = paged_put(fs, e->path, e->path_len, val_buf, sizeof(dino));
@@ -2416,8 +2495,7 @@ static int dir_add_child(struct xxfs *fs, const char *dir_path, u32 dplen,
             }
         } else {
             struct xxfs_inode dino;
-            u32 vlen = sizeof(dino);
-            if (paged_get(fs, dir_path, dplen, &dino, &vlen) != XXFS_OK)
+            if (inode_paged_get(fs, dir_path, dplen, &dino) != XXFS_OK)
                 return XXFS_ENOENT;
             if (dino.i_size > 0 && dino.i_extent_off) {
                 u64 child_bytes = dino.i_size;
@@ -2479,8 +2557,7 @@ static int dir_remove_child(struct xxfs *fs, const char *dir_path, u32 dplen,
             }
         } else {
             struct xxfs_inode dino;
-            u32 vlen = sizeof(dino);
-            if (paged_get(fs, dir_path, dplen, &dino, &vlen) != XXFS_OK)
+            if (inode_paged_get(fs, dir_path, dplen, &dino) != XXFS_OK)
                 return XXFS_ENOENT;
             if (dino.i_size > 0 && dino.i_extent_off) {
                 u64 child_bytes = dino.i_size;
@@ -2578,8 +2655,7 @@ int xxfs_readdir(struct xxfs *fs, const char *path, struct xxfs_readdir_ctx *ctx
     }
 
     struct xxfs_inode ino;
-    u32 vlen = sizeof(ino);
-    if (paged_get(fs, norm, nlen, &ino, &vlen) != XXFS_OK) {
+    if (inode_paged_get(fs, norm, nlen, &ino) != XXFS_OK) {
         fs_runlock(fs);
         return XXFS_ENOENT;
     }

@@ -39,6 +39,9 @@ target_link_libraries(xxfs-bench PRIVATE xxfs pthread)
 add_executable(posix-bench bench/posix_bench.c)
 target_link_libraries(posix-bench PRIVATE pthread)
 
+add_executable(read-bench bench/read_bench.c)
+target_link_libraries(read-bench PRIVATE xxfs pthread)
+
 add_executable(test-basic test/test_basic.c)
 target_link_libraries(test-basic PRIVATE xxfs pthread)
 

@@ -96,6 +96,15 @@ typedef _Bool bool;
 #define XXFS_FLAG_ENCRYPT    0x0020ULL
 #define XXFS_FLAG_NOLOCK     0x0040ULL
 
+#define XXFS_ECC_BYTES_PER_64 1
+#define XXFS_ECC_INODE_WORDS 62
+#define XXFS_ECC_INODE_SIZE XXFS_ECC_INODE_WORDS
+#define XXFS_ECC_SUPER_SIZE 64
+
+#define XXFS_ECC_OK 0
+#define XXFS_ECC_CORRECTED 1
+#define XXFS_ECC_UNCORRECTABLE 2
+
 struct xxfs_super {
     u32 s_magic;
     u32 s_version;
@@ -135,7 +144,8 @@ struct xxfs_super {
     u32 s_pdir_size;
     u8  s_pdir_depth;
     u8  s_pad[3];
-    u8  s_reserved[3868];
+    u8 s_ecc[XXFS_ECC_SUPER_SIZE];
+    u8 s_reserved[3804];
 } __attribute__((packed));
 
 struct xxfs_bg_desc {
@@ -181,7 +191,7 @@ struct xxfs_inode {
         };
     };
     u32 i_checksum;
-    u8  i_reserved4[4];
+    u8 i_ecc[XXFS_ECC_INODE_SIZE];
 };
 
 struct xxfs_extent {
@@ -315,6 +325,8 @@ void   xxfs_os_write_unlock(struct xxfs_os_lock *l);
 
 u64    xxfs_os_time(void);
 u32    xxfs_os_crc32c(const void *data, size_t len);
+void xxfs_os_ecc_compute(const void *data, size_t len, u8 *ecc_out);
+int xxfs_os_ecc_correct(void *data, size_t len, const u8 *ecc_stored);
 
 struct xxfs *xxfs_mount(const char *path, u64 flags);
 void         xxfs_umount(struct xxfs *fs);
@@ -342,6 +354,7 @@ int  xxfs_sync(struct xxfs *fs);
 int  xxfs_open(struct xxfs *fs, const char *path, u32 flags, struct xxfs_file **fp);
 int  xxfs_close(struct xxfs *fs, struct xxfs_file *fp);
 ssize_t xxfs_write_fd(struct xxfs *fs, struct xxfs_file *fp, const void *buf, size_t count, u64 off);
+ssize_t xxfs_read_fd(struct xxfs *fs, struct xxfs_file *fp, void *buf, size_t count, u64 off);
 
 struct xxfs_fs_info {
     u32 version;
@@ -363,6 +376,7 @@ struct xxfs_file {
 };
 
 int  xxfs_info(const struct xxfs *fs, struct xxfs_fs_info *info);
+int xxfs_sync_file(struct xxfs *fs);
 
 #ifdef XXFS_PROFILE
 struct xxfs_profile {

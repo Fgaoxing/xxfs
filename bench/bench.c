@@ -206,6 +206,38 @@ static int bench_write_large(struct xxfs *fs, u32 block_count)
     return 0;
 }
 
+static int bench_write_large_sync(struct xxfs *fs, u32 block_count)
+{
+    /* 先清理所有脏页，确保后面测的是干净状态 */
+    xxfs_sync(fs);
+
+    xxfs_create(fs, "/largefile_s", 0644, 0, 0);
+    struct xxfs_file *fp;
+    xxfs_open(fs, "/largefile_s", 0, &fp);
+    u64 total_size = (u64)block_count * 4096;
+    u8 zero = 0;
+    xxfs_write_fd(fs, fp, &zero, 1, total_size - 1);
+    xxfs_sync(fs);
+
+    u8 block[4096];
+    for (u32 i = 0; i < sizeof(block); i++)
+        block[i] = (u8)(i & 0xFF);
+
+    u64 t0 = now_ns();
+    for (u32 i = 0; i < block_count; i++) {
+        xxfs_write_fd(fs, fp, block, 4096, (u64)i * 4096);
+        xxfs_sync_file(fs);  /* 只 fsync，不刷元数据 */
+    }
+    u64 t1 = now_ns();
+    xxfs_close(fs, fp);
+    print_result("write 4K fsync (sequential)", t1 - t0, block_count);
+    double sec = (double)(t1 - t0) / 1e9;
+    double mb_s = (double)total_size / (1024.0 * 1024.0) / sec;
+    printf("  throughput: %.2f MB/s\n", mb_s);
+    xxfs_unlink(fs, "/largefile_s");
+    return 0;
+}
+
 static int bench_sync(struct xxfs *fs, u32 iter)
 {
     u64 t0 = now_ns();
@@ -264,7 +296,8 @@ int main(int argc, char *argv[])
     printf("\n");
 
     printf("[1/12] mkfs...\n");
-    xxfs_mkfs(img, size_mb, 0);
+    u32 mkfs_flags = (strncmp(img, "/dev/", 5) == 0) ? 0x100 : 0;
+    xxfs_mkfs(img, size_mb, mkfs_flags);
 
     printf("[2/12] mount...\n");
     struct xxfs *fs = xxfs_mount(img, XXFS_FLAG_NOLOCK);
@@ -272,6 +305,12 @@ int main(int argc, char *argv[])
         fprintf(stderr, "bench: mount failed\n");
         return 1;
     }
+
+    printf("\n--- Large File (clean device) ---\n");
+    bench_write_large(fs, 256);
+    bench_write_large_sync(fs, 256);
+    xxfs_unlink(fs, "/largefile");
+    xxfs_unlink(fs, "/largefile_s");
 
     printf("\n--- Create / Stat ---\n");
     bench_create(fs, nfiles);
@@ -282,9 +321,6 @@ int main(int argc, char *argv[])
     bench_write_inline(fs, nfiles);
     bench_read_inline(fs, nfiles);
     bench_read_random(fs, nfiles, rand_iter);
-
-    printf("\n--- Large File ---\n");
-    bench_write_large(fs, 256);
 
     printf("\n--- Directory ---\n");
     u32 dir_count = nfiles > 1000 ? 1000 : nfiles;
